@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+
+# Virtual environment
+.venv/
+venv/
+
+# Data (raw text, tokenized .bin files, tokenizer files)
+data/
+
+# Checkpoints
+checkpoints/
+
+# Model artifacts
+*.pt
+*.bin
+*.safetensors
+
+# Environment
+.env
+.env.local
+
+# CLAUDE.md is project instructions, not committed
+CLAUDE.md
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

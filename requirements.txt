@@ -1,0 +1,20 @@
+# Core deep learning
+# Pinned to the CUDA 13.0 build (cu130) — see scripts/setup.ps1 for why.
+torch==2.10.0+cu130
+
+# Numerical helpers
+# 2.x required: datasets 3.1.0 (TinyStories loader) imports pyarrow, which
+# refuses to load on NumPy 1.x. torch 2.10.0+cu130 supports NumPy 2.x.
+numpy==2.2.4
+
+# Progress bars
+tqdm==4.67.1
+
+# Testing
+pytest==8.3.2
+
+# Plotting (loss curves)
+matplotlib==3.9.2
+
+# Dataset downloading (TinyStories) — only used by scripts/download_data.py
+datasets==3.1.0
