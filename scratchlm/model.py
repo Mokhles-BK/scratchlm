@@ -149,6 +149,43 @@ def apply_rope(x, cos, sin):
 # Causal self-attention
 # ---------------------------------------------------------------------------
 
+class KVCache:
+    """Remembers the keys and values of tokens already processed (Phase 5).
+
+    WHY: when generating text one token at a time, the keys k and values v of
+    the PAST tokens never change (a token cannot see the future, so nothing
+    new can alter it). Recomputing them for the whole prompt at every step is
+    wasted work. Instead we store them here and only compute k, v for the ONE
+    new token, then attend over [stored past + new].
+
+        without cache: step t costs a forward pass over all t tokens
+        with cache   : step t costs a forward pass over 1 token
+
+    One KVCache belongs to ONE attention layer (every layer has its own k, v).
+    Shapes stored: (B, H, max_len, D). `length` = how many positions are filled.
+    """
+
+    def __init__(self, max_len):
+        self.max_len = max_len
+        self.length = 0
+        self.k = None   # allocated on first use, so dtype/device match the model
+        self.v = None
+
+    def update(self, k_new, v_new):
+        """Append k_new, v_new (B, H, T_new, D); return ALL keys/values so far."""
+        B, H, T_new, D = k_new.shape
+        if self.length + T_new > self.max_len:
+            raise ValueError(f"KV cache overflow: {self.length} + {T_new} > {self.max_len}")
+        if self.k is None:
+            self.k = torch.zeros(B, H, self.max_len, D, dtype=k_new.dtype, device=k_new.device)
+            self.v = torch.zeros(B, H, self.max_len, D, dtype=v_new.dtype, device=v_new.device)
+        end = self.length + T_new
+        self.k[:, :, self.length:end] = k_new
+        self.v[:, :, self.length:end] = v_new
+        self.length = end
+        return self.k[:, :, :end], self.v[:, :, :end]
+
+
 class CausalSelfAttention(nn.Module):
     """Multi-head self-attention where each token only sees tokens before it.
 
@@ -175,7 +212,7 @@ class CausalSelfAttention(nn.Module):
         # Mixes the concatenated heads back together: C -> C.
         self.out_proj = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
 
-    def forward(self, x, cos, sin):                      # x: (B, T, C)
+    def forward(self, x, cos, sin, cache=None):          # x: (B, T, C)
         B, T, C = x.shape
         q, k, v = self.qkv(x).split(C, dim=-1)           # each (B, T, C)
 
@@ -184,16 +221,36 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
 
-        # Inject position information by rotating q and k (NOT v).
-        q = apply_rope(q, cos[:T], sin[:T])
-        k = apply_rope(k, cos[:T], sin[:T])
+        # Position of the first token of x in the whole sequence. Normally 0;
+        # while generating with a cache, x holds only NEW tokens and `start` is
+        # how many tokens were already processed.
+        start = cache.length if cache is not None else 0
 
-        # Fused attention kernel. is_causal=True applies the lower-triangular
-        # mask for us. Mathematically:
-        #   scores = q @ k^T / sqrt(D)          (B, H, T, T)
-        #   scores[t, s] = -inf for s > t       (the causal mask)
+        # Inject position information by rotating q and k (NOT v).
+        q = apply_rope(q, cos[start:start + T], sin[start:start + T])
+        k = apply_rope(k, cos[start:start + T], sin[start:start + T])
+
+        # With a cache: store the new k, v and attend over EVERYTHING so far.
+        # k, v become (B, H, S, D) with S = start + T.
+        if cache is not None:
+            k, v = cache.update(k, v)
+
+        # Fused attention kernel. Mathematically:
+        #   scores = q @ k^T / sqrt(D)          (B, H, T, S)
+        #   scores[t, s] = -inf for s > start+t (the causal mask)
         #   y = softmax(scores) @ v             (B, H, T, D)
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        if start == 0:
+            # Normal case (training, or the first pass over a prompt).
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        elif T == 1:
+            # One new token after a cache: it may look at every stored token,
+            # so no mask is needed at all.
+            y = F.scaled_dot_product_attention(q, k, v)
+        else:
+            # Several new tokens after a cache: query i (absolute position
+            # start+i) may see keys 0..start+i. Build that mask explicitly.
+            mask = torch.ones(T, start + T, dtype=torch.bool, device=x.device).tril(diagonal=start)
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
 
         # Glue the heads back together: (B, H, T, D) -> (B, T, H, D) -> (B, T, C)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
@@ -245,8 +302,8 @@ class Block(nn.Module):
         self.norm2 = RMSNorm(cfg.d_model, cfg.norm_eps)
         self.mlp = SwiGLU(cfg)
 
-    def forward(self, x, cos, sin):                      # x: (B, T, C)
-        x = x + self.attn(self.norm1(x), cos, sin)
+    def forward(self, x, cos, sin, cache=None):          # x: (B, T, C)
+        x = x + self.attn(self.norm1(x), cos, sin, cache)
         x = x + self.mlp(self.norm2(x))
         return x
 
@@ -298,22 +355,29 @@ class GPT(nn.Module):
         """Total trainable parameters. The tied matrix is counted once."""
         return sum(p.numel() for p in self.parameters())
 
-    def forward(self, idx, targets=None, ignore_index=-100):
+    def make_caches(self):
+        """One empty KVCache per layer, for fast generation (see KVCache)."""
+        return [KVCache(self.cfg.block_size) for _ in self.blocks]
+
+    def forward(self, idx, targets=None, ignore_index=-100, caches=None):
         """
-        idx     : (B, T) int64 token ids
+        idx     : (B, T) int64 token ids. With `caches`, only the NEW tokens.
         targets : (B, T) int64 next-token ids, or None
+        caches  : list of KVCache from make_caches(), or None (training).
         returns : logits (B, T, V), and the mean cross-entropy loss if
                   targets were given (else None). Positions whose target equals
                   ignore_index are skipped in the loss (used later for chat
                   fine-tuning).
         """
         B, T = idx.shape
-        if T > self.cfg.block_size:
-            raise ValueError(f"sequence length {T} exceeds block_size {self.cfg.block_size}")
+        already = caches[0].length if caches is not None else 0   # tokens seen before
+        if already + T > self.cfg.block_size:
+            raise ValueError(f"sequence length {already + T} exceeds block_size {self.cfg.block_size}")
 
         x = self.tok_emb(idx)                            # (B, T, C)
-        for block in self.blocks:
-            x = block(x, self.rope_cos, self.rope_sin)   # (B, T, C)
+        for i, block in enumerate(self.blocks):
+            cache = caches[i] if caches is not None else None
+            x = block(x, self.rope_cos, self.rope_sin, cache)   # (B, T, C)
         x = self.norm_f(x)
         logits = self.lm_head(x)                         # (B, T, V)
 
