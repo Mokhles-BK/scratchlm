@@ -76,6 +76,7 @@ class TrainConfig:
     eval_interval: int = 250       # validate every N steps
     eval_batches: int = 50         # batches averaged per validation
     ckpt_interval: int = 500       # write latest.pt every N steps
+    milestone_interval: int = 0    # also keep step_XXXXXX.pt every N steps (0 = off)
     log_interval: int = 10         # print + CSV row every N steps
     seed: int = 1337
 
@@ -346,6 +347,10 @@ def train(tcfg: TrainConfig, model_cfg: GPTConfig, resume=False, stop_at_step=No
 
             if step % tcfg.ckpt_interval == 0 or step == end_step:
                 checkpoint(latest)
+            # Milestones are never overwritten: they let us look at the SAME
+            # run at different ages (Phase 6: how do samples improve?).
+            if tcfg.milestone_interval and step % tcfg.milestone_interval == 0:
+                checkpoint(out_dir / f"step_{step:06d}.pt")
     except KeyboardInterrupt:
         log(f"\nInterrupted at step {step}: saving checkpoint ...")
         checkpoint(latest)
@@ -377,6 +382,8 @@ def main():
     p.add_argument("--eval-interval", type=int, default=250)
     p.add_argument("--eval-batches", type=int, default=50)
     p.add_argument("--ckpt-interval", type=int, default=500)
+    p.add_argument("--milestone-interval", type=int, default=0,
+                   help="also keep step_XXXXXX.pt every N steps (0 = off)")
     p.add_argument("--log-interval", type=int, default=10)
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--data-dir", default=str(REPO_ROOT / "data"))
@@ -388,7 +395,8 @@ def main():
         micro_batch_size=a.micro_batch_size, grad_accum_steps=a.grad_accum_steps,
         max_steps=a.max_steps, lr=a.lr if a.lr else (1e-3 if a.model == "small" else 6e-4),
         warmup_steps=a.warmup_steps, eval_interval=a.eval_interval, eval_batches=a.eval_batches,
-        ckpt_interval=a.ckpt_interval, log_interval=a.log_interval, seed=a.seed,
+        ckpt_interval=a.ckpt_interval, milestone_interval=a.milestone_interval,
+        log_interval=a.log_interval, seed=a.seed,
     )
     try:
         train(tcfg, model_cfg, resume=a.resume, stop_at_step=a.stop_at_step)
